@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environtment Variable
+.env
+
+# Guard rail: if data ever accidentally gets placed inside the project,
+# don't let it get committed.
+/data/
+/output/

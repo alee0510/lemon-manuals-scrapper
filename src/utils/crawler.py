@@ -32,7 +32,7 @@ from src.models.sites import Breadcrumb, BrokenLink, SiteGraph, SiteNode
 from src.utils.path import resolve_href
 from src.utils.signature import classify
 
-IGNORED_TARGETS = {"404.html", "about.html", "contact.html"}
+IGNORED_TARGETS = {"404.html", "about.html"}
 
 def crawler(dataset: DiscoveredDataset) -> SiteGraph:
     nodes: dict[str, SiteNode] = {}

@@ -1,6 +1,7 @@
 from src.configs.settings import settings
 from src.utils.discover import discover
 from src.utils.crawler import crawler
+from src.utils.writer import write_dataset
 
 def main():
     result = discover(settings.data_dir)
@@ -9,18 +10,20 @@ def main():
     for skipped in result.skipped:
         print(f"Skipped - {skipped.name}: {skipped.reason.value}")
 
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
     for dataset in result.datasets:
         print(f"\nProcessing dataset: {dataset.name}")
         print(f"Total .html file {dataset.html_file_count}")
 
         graph = crawler(dataset)
-        print(f"\nBuilt site graph for dataset: {graph.dataset_name}")
+        print(f"Built site graph for dataset: {graph.dataset_name}")
         print(f"Nodes: {len(graph.nodes)}")
         print(f"Broken links: {len(graph.broken_links)}")
 
-        # 2 sample pages
-        for node in list(graph.nodes.values())[:2]:
-            print(f"- Node: {node.page_path} \n ==>> Parent: {node.parents} \n ==> Children: {node.children} \n ==> Type: {node.page_type} \n ==> Breadcrumbs: {node.breadcrumbs} \n")
+        dataset_dir = write_dataset(settings.output_dir, dataset, graph)
+        page_count = len(list((dataset_dir / "pages").glob("*.json")))
+        print(f"Wrote {page_count} page JSON file(s) to {dataset_dir}")
 
 if __name__ == "__main__":
     main()

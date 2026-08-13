@@ -27,7 +27,18 @@ def classify(soup: BeautifulSoup) -> PageType:
 def _classify_table(table) -> PageType:
     thead = table.find("thead")
     tbody = table.find("tbody")
-    if thead is None or tbody is None:
+
+    # No <thead> — this is the fingerprint of the image-description
+    # pattern from pages/700.html, 826.html, 909.html: a colgroup-only
+    # table whose single <tbody> row wraps a div.imageHolder containing
+    # an <img> (+ an imageCourtesyNote caption). Check for that shape
+    # before giving up, instead of falling straight to UNKNOWN.
+    if thead is None:
+        if tbody is not None and _looks_like_image_description(tbody):
+            return PageType.IMAGE_DESCRIPTION
+        return PageType.UNKNOWN
+
+    if tbody is None:
         return PageType.UNKNOWN
 
     rows = tbody.find_all("tr", recursive=False)
@@ -51,6 +62,18 @@ def _row_has_depth_signal(tr) -> bool:
         if "padding-left" in style:
             return True
     return False
+
+def _looks_like_image_description(tbody) -> bool:
+    """
+    Matches the pattern from pages/700.html, 826.html, 909.html: a
+    thead-less table whose tbody wraps a single imageHolder div
+    containing an <img> tag, typically paired with an
+    imageCourtesyNote <span> caption.
+    """
+    holder = tbody.find("div", class_="imageHolder")
+    if holder is None:
+        return False
+    return holder.find("img") is not None
 
 def _looks_like_index(main) -> bool:
     """

@@ -9,7 +9,7 @@ class SkipReason(StrEnum):
     """
     NOT_A_DIRECTORY = "not_a_directory"
     MISSING_INDEX = "missing_index"
-    HIDDEN_OR_SYSTEM = "hidden_or_system_entry" # e.g. .git, Trash, Cache, node_modules, .DS_Store, etc.
+    HIDDEN_OR_SYSTEM = "hidden_or_system_entry"
 
 class DiscoveredDataset(BaseModel):
     """One valid dataset found under data_dir — a folder with an index.html."""

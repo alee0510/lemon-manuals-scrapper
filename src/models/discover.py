@@ -17,6 +17,7 @@ class DiscoveredDataset(BaseModel):
     root_dir: Path # absolute path to the dataset folder
     index_path: Path # absolute path to its index.html
     size_bytes: int | None = None # populated lazily/optionally
+    html_file_count: int | None = None # optional cheap stat: len(list(root_dir.rglob("*.html")))
 
 class SkippedEntry(BaseModel):
        """A top-level entry under data_dir that was NOT treated as a dataset."""

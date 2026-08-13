@@ -37,6 +37,7 @@ def discover(data_dir: Path) -> DiscoveryResult:
             name=entry.name,
             root_dir=entry,
             index_path=index_path,
+            html_file_count=len(list(entry.rglob("*.html"))),
         ))
 
     return result

@@ -25,6 +25,8 @@ from src.models.content import (
     ImageDescriptionContent,
     ImageItem,
     UnknownContent,
+    DTCEntry,
+    DTCTableContent,
 )
 from src.utils.path import resolve_href
 from src.helper.attribute import _attr_str
@@ -33,6 +35,7 @@ from src.helper.attribute import _attr_str
 # kept in sync here so IndexItem.target_id doesn't resolve to noise like
 # 404.html either.
 IGNORED_TARGETS = {"404.html", "about.html"}
+DTC_COLUMN_SIGNATURE = ("dtc", "description", "action")
 
 
 def extract(
@@ -75,6 +78,8 @@ def _extract_body(main: Tag | None, page_type: PageType, source_path: str) -> Pa
         table = main.find("table")
         if table is None:
             return UnknownContent(raw_text=main.get_text(" ", strip=True))
+        if page_type == PageType.FLAT_TABLE and _looks_like_dtc_table(table):
+            return _extract_dtc_table(table, source_path)
         return _extract_table(table, source_path)
 
     if page_type == PageType.IMAGE_DESCRIPTION:
@@ -84,7 +89,6 @@ def _extract_body(main: Tag | None, page_type: PageType, source_path: str) -> Pa
             return UnknownContent(raw_text=main.get_text(" ", strip=True))
         return _extract_image_description(tbody)
 
-    # PageType.UNKNOWN, or anything else not yet handled
     return UnknownContent(raw_text=main.get_text(" ", strip=True))
 
 
@@ -231,6 +235,50 @@ def _extract_image_description(tbody: Tag) -> ImageDescriptionContent:
 
     return ImageDescriptionContent(images=images)
 
+# ---------------------------------------------------------------------------
+# DTC_TABLE
+# ---------------------------------------------------------------------------
+
+def _looks_like_dtc_table(table: Tag) -> bool:
+    """
+    Matches pages/31879.html's column shape: DTC | Description | Action.
+    Checked on lowercased header text so minor casing differences across
+    the 100+ datasets don't miss the pattern.
+    """
+    thead = table.find("thead")
+    if thead is None:
+        return False
+    headers = [th.get_text(strip=True).lower() for th in thead.find_all("th")]
+    return headers[:3] == list(DTC_COLUMN_SIGNATURE)
+
+
+def _extract_dtc_table(table: Tag, source_path: str) -> DTCTableContent:
+    tbody = table.find("tbody")
+    if tbody is None:
+        return DTCTableContent(entries=[])
+
+    entries: list[DTCEntry] = []
+    for tr in tbody.find_all("tr", recursive=False):
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 3:
+            continue
+
+        code = tds[0].get_text(strip=True)
+        description = tds[1].get_text(strip=True)
+
+        action_cell = tds[2]
+        action_text = action_cell.get_text(strip=True) or None
+        a = action_cell.find("a", href=True)
+        target_id = _resolve_target_id(source_path, _attr_str(a.get("href"))) if a else None
+
+        entries.append(DTCEntry(
+            code=code,
+            description=description,
+            action_text=action_text,
+            target_id=target_id,
+        ))
+
+    return DTCTableContent(entries=entries)
 
 # ---------------------------------------------------------------------------
 # shared helper
@@ -260,3 +308,4 @@ def _resolve_target_id(source_path: str, href: str) -> str | None:
         page_path = page_path[: -len(".html")]
 
     return page_path or None
+

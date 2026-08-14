@@ -77,7 +77,22 @@ class UnknownContent(BaseModel):
     raw_text: str = ""
 
 
-PageContentBody = Union[IndexContent, TableContent, ImageDescriptionContent, UnknownContent]
+# ---------------------------------------------------------------------------
+# DTC - Diagnostic Trouble Code
+# ---------------------------------------------------------------------------
+
+class DTCEntry(BaseModel):
+    code: str                       # e.g. "P060D:00"
+    description: str
+    action_text: str | None = None  # e.g. "GO to Pinpoint Test DK"
+    target_id: str | None = None    # resolved page id the Action column links to
+
+class DTCTableContent(BaseModel):
+    kind: Literal["dtc_table"] = "dtc_table"
+    entries: list[DTCEntry] = Field(default_factory=list)
+
+
+PageContentBody = Union[IndexContent, TableContent, DTCTableContent, ImageDescriptionContent, UnknownContent]
 
 
 # ---------------------------------------------------------------------------

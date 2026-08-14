@@ -96,14 +96,22 @@ def _extract_index(main: Tag, source_path: str) -> IndexContent:
     sections: list[IndexSection] = []
     notes: list[str] = []
 
+    # Tags that are page chrome, not content — excluded from notes so
+    # e.g. the "Expand All"/"Collapse All" buttons on pages/25280.html
+    # don't block that page from being recognized as a pure pass-through
+    # (single-link INDEX page with no real accompanying text).
+    _CHROME_TAGS = {"button", "script", "style"}
+
     for child in main.children:
         if not isinstance(child, Tag):
             continue
 
         if child.name == "ul":
             sections.append(_extract_index_section(child, source_path))
-        elif child.name in ("h1",):
+        elif child.name == "h1":
             continue  # title already captured separately via _extract_common in crawler
+        elif child.name in _CHROME_TAGS:
+            continue  # page chrome, not content
         else:
             text = child.get_text(" ", strip=True)
             if text:

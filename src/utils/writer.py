@@ -4,21 +4,28 @@ Writer: turns a dataset's SiteGraph into the on-disk output layout —
     <output_dir>/<dataset_name>/main.json
     <output_dir>/<dataset_name>/pages/<id>.json
 
-Two responsibilities live here that don't belong in crawler.py or
+Three responsibilities live here that don't belong in crawler.py or
 extractor.py:
 
 1. Re-parsing each node's HTML to run extract() — crawler.py discards the
-   BeautifulSoup object once a node is built (by design, see its docstring:
-   it's the cheap structural pass), so getting content requires a second
-   read. For 50k-page datasets this is a real cost; see the note at the
-   bottom of this file for how to avoid it later without changing
-   crawler.py's contract.
+   BeautifulSoup object once a node is built (it's the cheap structural
+   pass), so getting content requires a second read. For 50k-page
+   datasets this is a real cost; see the note at the bottom of this file.
 
-2. Alias resolution — for any genuine content duplicates found within the
-   crawled subtree (e.g. two differently-named pages resolving to
-   byte-identical extracted content), one canonical id is kept and the
-   other becomes an alias entry in main.json rather than its own
-   pages/*.json file.
+2. Pass-through collapsing — an INDEX page whose entire content is a
+   single link and no notes (e.g. pages/25280.html "Common Specs &
+   Procedures" -> pages/31917.html "Common Specifications & Procedures")
+   contributes zero real content, just an extra graph hop and a
+   near-duplicate label. These are dropped from output entirely; every
+   edge that pointed at them is rewired straight to their resolved final
+   target, and the target node records provenance via `collapsed_via` so
+   nothing is silently lost. Runs BEFORE alias hashing, since collapsing
+   changes which nodes even exist to be hashed.
+
+3. Alias resolution — for any genuine content duplicates remaining after
+   collapsing (two differently-named pages resolving to byte-identical
+   extracted content), one canonical id is kept and the other becomes an
+   alias entry in main.json rather than its own pages/*.json file.
 """
 
 from __future__ import annotations
@@ -29,22 +36,29 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
 from src.utils.discover import DiscoveredDataset
-from src.models.sites import SiteGraph, DatasetMetadata
+from src.models.sites import SiteGraph
 from src.models.content import PageContent
 from src.utils.extractor import extract
 
 
 # ---------------------------------------------------------------------------
 # Manifest models — main.json shape. Deliberately graph-only, no content,
-# so this file stays small even at 50k nodes (see crawler.py's own
-# docstring on why a flat dict was chosen over a nested tree).
+# so this file stays small even at 50k nodes.
 # ---------------------------------------------------------------------------
+
+class CollapsedLink(BaseModel):
+    """Provenance for a pass-through page that was dropped and rewired
+    straight to this node — e.g. {"id": "25280", "label": "Common Specs &
+    Procedures"} recorded on node "31917"."""
+    id: str
+    label: str
 
 class ManifestNode(BaseModel):
     page_type: str
     title: str
     children: list[str] = Field(default_factory=list)
     parents: list[str] = Field(default_factory=list)
+    collapsed_via: list[CollapsedLink] = Field(default_factory=list)
 
 class ManifestBrokenLink(BaseModel):
     source_page: str
@@ -110,9 +124,65 @@ def _build_content_map(dataset: DiscoveredDataset, graph: SiteGraph) -> dict[str
 
 
 # ---------------------------------------------------------------------------
-# Pass 2 — hash content bodies, collapse duplicates into aliases.
-# Iterates in dict insertion order, which is BFS discovery order, so the
-# first-seen id always wins as canonical.
+# Pass 2 — pass-through detection + transitive resolution.
+# A pass-through is an INDEX page with exactly one link total and no notes.
+# The crawl root is never eligible, even if it happens to match the shape.
+# ---------------------------------------------------------------------------
+
+def _find_passthroughs(content_map: dict[str, PageContent], root_id: str) -> dict[str, str]:
+    """Returns {passthrough_id: direct_target_id} for single-hop redirects."""
+    passthroughs: dict[str, str] = {}
+
+    for page_id, pc in content_map.items():
+        if page_id == root_id:
+            continue
+
+        content = pc.content
+        if content.kind != "index":
+            continue
+        if content.notes:
+            continue  # real accompanying text means it's not just a redirect
+
+        items = [item for section in content.sections for item in section.items]
+        if len(items) != 1:
+            continue
+
+        target = items[0].target_id
+        if target is None or target == page_id:
+            continue
+
+        passthroughs[page_id] = target
+
+    return passthroughs
+
+def _resolve_transitive(passthroughs: dict[str, str]) -> dict[str, str]:
+    """
+    Follows passthrough -> passthrough -> ... chains to the first
+    non-passthrough target. Cycle-guarded: a pathological A->B->A loop
+    falls back to leaving the chain unresolved (mapped to itself) rather
+    than looping forever.
+    """
+    resolved: dict[str, str] = {}
+
+    for start in passthroughs:
+        visited: set[str] = set()
+        current = start
+        while current in passthroughs and current not in visited:
+            visited.add(current)
+            current = passthroughs[current]
+
+        if current in visited:
+            # Cycle detected — bail out, don't collapse this chain at all.
+            continue
+
+        resolved[start] = current
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Pass 3 — content-hash alias detection, run AFTER passthrough removal so
+# dropped pass-through nodes never get hashed in the first place.
 # ---------------------------------------------------------------------------
 
 def _hash_content(pc: PageContent) -> str:
@@ -134,21 +204,48 @@ def _resolve_aliases(content_map: dict[str, PageContent]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Pass 3 — rewrite every id reference through the alias map.
+# Unified canonicalization — redirects (pass-through collapses) and aliases
+# (content duplicates) are semantically different (tracked separately in
+# the manifest) but both need to be followed when rewriting ids. IDs are
+# disjoint by construction (aliases are computed only over content that
+# already excludes passthrough ids), so a flat merge is safe. A visited
+# guard handles the rare case where a redirect's target itself later turns
+# out to be an alias of something else.
 # ---------------------------------------------------------------------------
 
-def _canonical(page_id: str, aliases: dict[str, str]) -> str:
-    return aliases.get(page_id, page_id)
+def _build_canonical_resolver(redirects: dict[str, str], aliases: dict[str, str]):
+    combined = {**redirects, **aliases}
 
-def _remap_graph(graph: SiteGraph, aliases: dict[str, str]) -> dict[str, ManifestNode]:
+    def canonical(page_id: str) -> str:
+        current = page_id
+        visited: set[str] = set()
+        while current in combined and current not in visited:
+            visited.add(current)
+            current = combined[current]
+        return current
+
+    return canonical
+
+
+# ---------------------------------------------------------------------------
+# Pass 4 — rewrite the graph: drop collapsed/alias nodes, rewire every
+# children/parents edge through the canonical resolver, attach
+# collapsed_via provenance to surviving target nodes.
+# ---------------------------------------------------------------------------
+
+def _remap_graph(
+    graph: SiteGraph,
+    canonical,
+    collapsed_labels: dict[str, str],   # passthrough_id -> its own title/label
+) -> dict[str, ManifestNode]:
     remapped: dict[str, ManifestNode] = {}
 
     for page_path, node in graph.nodes.items():
         page_id = page_path_to_id(page_path)
-        canonical_id = _canonical(page_id, aliases)
+        canonical_id = canonical(page_id)
 
-        children = sorted({_canonical(page_path_to_id(c), aliases) for c in node.children})
-        parents = sorted({_canonical(page_path_to_id(p), aliases) for p in node.parents})
+        children = sorted({canonical(page_path_to_id(c)) for c in node.children})
+        parents = sorted({canonical(page_path_to_id(p)) for p in node.parents})
 
         if canonical_id in remapped:
             existing = remapped[canonical_id]
@@ -162,13 +259,29 @@ def _remap_graph(graph: SiteGraph, aliases: dict[str, str]) -> dict[str, Manifes
                 parents=parents,
             )
 
+    # Attach collapsed_via provenance: every passthrough id that resolved
+    # to this node gets recorded here, using the passthrough's own title.
+    for passthrough_id, label in collapsed_labels.items():
+        target_id = canonical(passthrough_id)
+        if target_id in remapped:
+            remapped[target_id].collapsed_via.append(
+                CollapsedLink(id=passthrough_id, label=label)
+            )
+
+    for node in remapped.values():
+        node.collapsed_via.sort(key=lambda c: c.id)
+
     return remapped
 
-def _remap_content(content_map: dict[str, PageContent], aliases: dict[str, str]) -> dict[str, PageContent]:
+def _remap_content(
+    content_map: dict[str, PageContent],
+    canonical,
+    dropped_ids: set[str],   # passthrough ids + alias ids — excluded from output
+) -> dict[str, PageContent]:
     remapped: dict[str, PageContent] = {}
 
     for page_id, pc in content_map.items():
-        if page_id in aliases:
+        if page_id in dropped_ids:
             continue
 
         content = pc.content
@@ -176,10 +289,10 @@ def _remap_content(content_map: dict[str, PageContent], aliases: dict[str, str])
             for section in content.sections:
                 for item in section.items:
                     if item.target_id is not None:
-                        item.target_id = _canonical(item.target_id, aliases)
+                        item.target_id = canonical(item.target_id)
         elif content.kind == "table":
             for row in content.rows:
-                row.links = {col: _canonical(tid, aliases) for col, tid in row.links.items()}
+                row.links = {col: canonical(tid) for col, tid in row.links.items()}
 
         remapped[page_id] = pc
 
@@ -192,26 +305,41 @@ def _remap_content(content_map: dict[str, PageContent], aliases: dict[str, str])
 
 def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph) -> Path:
     """
-    Runs extraction + alias resolution for one dataset and writes:
+    Runs extraction + pass-through collapsing + alias resolution for one
+    dataset and writes:
         output_dir/<dataset.name>/main.json
         output_dir/<dataset.name>/pages/<id>.json
 
     Returns the dataset's output directory.
     """
     content_map = _build_content_map(dataset, graph)
-    aliases = _resolve_aliases(content_map)
+    root_id = page_path_to_id(graph.root)
 
-    manifest_nodes = _remap_graph(graph, aliases)
-    final_content = _remap_content(content_map, aliases)
+    # -- pass-through collapsing (before alias hashing) --------------------
+    passthroughs = _find_passthroughs(content_map, root_id)
+    redirects = _resolve_transitive(passthroughs)
+    collapsed_labels = {
+        pid: content_map[pid].title for pid in redirects
+    }
 
-    # root is now derived from graph.root (e.g. "pages/2.html" ->
-    # "2"), not hardcoded to "index" — crawler.py's entry point changed,
-    # this must follow it rather than assume a fixed root id.
-    root_id = _canonical(page_path_to_id(graph.root), aliases)
+    content_after_collapse = {
+        pid: pc for pid, pc in content_map.items() if pid not in redirects
+    }
+
+    # -- content-hash aliasing (after collapsing) ---------------------------
+    aliases = _resolve_aliases(content_after_collapse)
+
+    canonical = _build_canonical_resolver(redirects, aliases)
+    dropped_ids = set(redirects) | set(aliases)
+
+    manifest_nodes = _remap_graph(graph, canonical, collapsed_labels)
+    final_content = _remap_content(content_map, canonical, dropped_ids)
+
+    root_canonical = canonical(root_id)
 
     manifest = DatasetManifest(
         dataset_name=dataset.name,
-        root=root_id,
+        root=root_canonical,
         manufacturer=graph.metadata.manufacturer,
         year=graph.metadata.year,
         model=graph.metadata.model,
@@ -219,7 +347,7 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
         nodes=manifest_nodes,
         broken_links=[
             ManifestBrokenLink(
-                source_page=_canonical(page_path_to_id(bl.source_page), aliases),
+                source_page=canonical(page_path_to_id(bl.source_page)),
                 href=bl.href,
                 resolved_path=bl.resolved_path,
             )
@@ -227,7 +355,7 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
         ],
         out_of_scope_links=[
             ManifestOutOfScopeLink(
-                source_page=_canonical(page_path_to_id(ol.source_page), aliases),
+                source_page=canonical(page_path_to_id(ol.source_page)),
                 href=ol.href,
                 resolved_path=ol.resolved_path,
             )

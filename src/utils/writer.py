@@ -31,14 +31,13 @@ extractor.py:
 from __future__ import annotations
 import hashlib
 from pathlib import Path
-
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field
 
 from src.utils.discover import DiscoveredDataset
 from src.models.sites import SiteGraph
 from src.models.content import PageContent
 from src.models.graph import GraphNode, GraphEdge, DatasetGraph
+from src.models.writer import CollapsedLink, ManifestNode, ManifestBrokenLink, ManifestOutOfScopeLink, DatasetManifest , DatasetGraphSection
 from src.utils.extractor import extract
 
 _LABEL_BY_PAGE_TYPE = {
@@ -48,47 +47,6 @@ _LABEL_BY_PAGE_TYPE = {
     "image_description": "ComponentDiagram",
     "unknown": "Page",
 }
-
-# ---------------------------------------------------------------------------
-# Manifest models — main.json shape. Deliberately graph-only, no content,
-# so this file stays small even at 50k nodes.
-# ---------------------------------------------------------------------------
-
-class CollapsedLink(BaseModel):
-    """Provenance for a pass-through page that was dropped and rewired
-    straight to this node — e.g. {"id": "25280", "label": "Common Specs &
-    Procedures"} recorded on node "31917"."""
-    id: str
-    label: str
-
-class ManifestNode(BaseModel):
-    page_type: str
-    title: str
-    children: list[str] = Field(default_factory=list)
-    parents: list[str] = Field(default_factory=list)
-    collapsed_via: list[CollapsedLink] = Field(default_factory=list)
-
-class ManifestBrokenLink(BaseModel):
-    source_page: str
-    href: str
-    resolved_path: str
-
-class ManifestOutOfScopeLink(BaseModel):
-    source_page: str
-    href: str
-    resolved_path: str
-
-class DatasetManifest(BaseModel):
-    dataset_name: str
-    root: str
-    manufacturer: str | None = None
-    year: str | None = None
-    model: str | None = None
-    aliases: dict[str, str] = Field(default_factory=dict)   # alias_id -> canonical_id
-    nodes: dict[str, ManifestNode] = Field(default_factory=dict)
-    broken_links: list[ManifestBrokenLink] = Field(default_factory=list)
-    out_of_scope_links: list[ManifestOutOfScopeLink] = Field(default_factory=list)
-
 
 # ---------------------------------------------------------------------------
 # id derivation — must match extractor.py's _resolve_target_id exactly, or
@@ -385,34 +343,90 @@ def build_graph(
 
     return DatasetGraph(dataset_name=dataset.name, nodes=nodes, edges=edges)
 
+def build_graph_section(
+    dataset: DiscoveredDataset,
+    manifest: DatasetManifest,
+    content_by_id: dict[str, PageContent],
+) -> DatasetGraphSection:
+    nodes: list[GraphNode] = []
+    edges: list[GraphEdge] = []
+
+    dataset_node_id = f"dataset:{dataset.name}"
+    nodes.append(GraphNode(
+        id=dataset_node_id,
+        labels=["Dataset"],
+        properties={
+            "manufacturer": manifest.manufacturer,
+            "year": manifest.year,
+            "model": manifest.model,
+        },
+    ))
+    edges.append(GraphEdge(from_id=dataset_node_id, to_id=manifest.root, type="HAS_TOC"))
+
+    for page_id, mnode in manifest.nodes.items():
+        label = _LABEL_BY_PAGE_TYPE.get(mnode.page_type, "Page")
+        nodes.append(GraphNode(id=page_id, labels=[label], properties={"title": mnode.title}))
+
+        edge_type = "CONTAINS" if label == "Section" else "REFERENCES"
+        for child_id in mnode.children:
+            edges.append(GraphEdge(from_id=page_id, to_id=child_id, type=edge_type))
+
+        # Synthetic, non-traversable node per collapsed pass-through —
+        # e.g. "collapsed:25280" for the "Common Specs & Procedures" hop
+        # that got dropped and rewired straight to this node. Kept as its
+        # own node (not a self-loop) so the redirect's own id/label are
+        # first-class graph properties, queryable/traversable like any
+        # other node, rather than metadata buried on an edge with no
+        # distinct "from".
+        for collapsed in mnode.collapsed_via:
+            synthetic_id = f"collapsed:{collapsed.id}"
+            nodes.append(GraphNode(
+                id=synthetic_id,
+                labels=["CollapsedRedirect"],
+                properties={"original_id": collapsed.id, "label": collapsed.label},
+            ))
+            edges.append(GraphEdge(
+                from_id=synthetic_id,
+                to_id=page_id,
+                type="REDIRECTED_FROM",
+            ))
+
+    for alias_id, canonical_id in manifest.aliases.items():
+        edges.append(GraphEdge(from_id=alias_id, to_id=canonical_id, type="SAME_AS"))
+
+    for page_id, pc in content_by_id.items():
+        if pc.content.kind != "dtc_table":
+            continue
+        for entry in pc.content.entries:
+            dtc_node_id = f"dtc:{entry.code}"
+            nodes.append(GraphNode(
+                id=dtc_node_id, labels=["DTCCode"],
+                properties={"code": entry.code, "description": entry.description},
+            ))
+            edges.append(GraphEdge(from_id=page_id, to_id=dtc_node_id, type="CONTAINS"))
+            if entry.target_id is not None:
+                edges.append(GraphEdge(
+                    from_id=dtc_node_id, to_id=entry.target_id, type="DIAGNOSED_BY",
+                    properties={"action_text": entry.action_text},
+                ))
+
+    return DatasetGraphSection(nodes=nodes, edges=edges)
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph) -> Path:
-    """
-    Runs extraction + pass-through collapsing + alias resolution for one
-    dataset and writes:
-        output_dir/<dataset.name>/main.json
-        output_dir/<dataset.name>/pages/<id>.json
-
-    Returns the dataset's output directory.
-    """
     content_map = _build_content_map(dataset, graph)
     root_id = page_path_to_id(graph.root)
 
-    # -- pass-through collapsing (before alias hashing) --------------------
     passthroughs = _find_passthroughs(content_map, root_id)
     redirects = _resolve_transitive(passthroughs)
-    collapsed_labels = {
-        pid: content_map[pid].title for pid in redirects
-    }
+    collapsed_labels = {pid: content_map[pid].title for pid in redirects}
 
     content_after_collapse = {
         pid: pc for pid, pc in content_map.items() if pid not in redirects
     }
-
-    # -- content-hash aliasing (after collapsing) ---------------------------
     aliases = _resolve_aliases(content_after_collapse)
 
     canonical = _build_canonical_resolver(redirects, aliases)
@@ -449,18 +463,17 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
         ],
     )
 
+    # graph section is built from the manifest + final content that's
+    # already collapsed/aliased — same as before, just attached to
+    # `manifest.graph` instead of written to a separate file.
+    manifest.graph = build_graph_section(dataset, manifest, final_content)
 
     dataset_dir = output_dir / dataset.name
     pages_dir = dataset_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     (dataset_dir / "main.json").write_text(
-        manifest.model_dump_json(indent=2), encoding="utf-8"
-    )
-
-    graph_model = build_graph(dataset, manifest, final_content)
-    (dataset_dir / "graph.json").write_text(
-        graph_model.model_dump_json(indent=2, by_alias=True), encoding="utf-8"
+        manifest.model_dump_json(indent=2, by_alias=True), encoding="utf-8"
     )
 
     for page_id, pc in final_content.items():

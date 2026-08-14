@@ -38,8 +38,16 @@ from pydantic import BaseModel, Field
 from src.utils.discover import DiscoveredDataset
 from src.models.sites import SiteGraph
 from src.models.content import PageContent
+from src.models.graph import GraphNode, GraphEdge, DatasetGraph
 from src.utils.extractor import extract
 
+_LABEL_BY_PAGE_TYPE = {
+    "index": "Section",
+    "hierarchical_spec_table": "Procedure",
+    "flat_table": "DTCTable",
+    "image_description": "ComponentDiagram",
+    "unknown": "Page",
+}
 
 # ---------------------------------------------------------------------------
 # Manifest models — main.json shape. Deliberately graph-only, no content,
@@ -298,6 +306,84 @@ def _remap_content(
 
     return remapped
 
+# ---------------------------------------------------------------------------
+# Pass 4 — build the graph structure using the manifest + content.
+# ---------------------------------------------------------------------------
+
+def build_graph(
+    dataset: DiscoveredDataset,
+    manifest: DatasetManifest,
+    content_by_id: dict[str, PageContent],
+) -> DatasetGraph:
+    nodes: list[GraphNode] = []
+    edges: list[GraphEdge] = []
+
+    dataset_node_id = f"dataset:{dataset.name}"
+    nodes.append(GraphNode(
+        id=dataset_node_id,
+        labels=["Dataset"],
+        properties={
+            "manufacturer": manifest.manufacturer,
+            "year": manifest.year,
+            "model": manifest.model,
+        },
+    ))
+    edges.append(GraphEdge(from_id=dataset_node_id, to_id=manifest.root, type="HAS_TOC"))
+
+    for page_id, mnode in manifest.nodes.items():
+        label = _LABEL_BY_PAGE_TYPE.get(mnode.page_type, "Page")
+
+        # A DTCTable node's actual codes get promoted below; the table
+        # node itself still exists as a container, just without raw
+        # table rows duplicated onto it as properties.
+        nodes.append(GraphNode(
+            id=page_id,
+            labels=[label],
+            properties={"title": mnode.title},
+        ))
+
+        # Structural containment: only Section (INDEX) pages get CONTAINS
+        # edges to their children — that's genuine navigational hierarchy.
+        # Non-Section pages' "children" (cross-links inside table cells,
+        # etc.) become REFERENCES instead, since linking to a pinpoint
+        # test from a DTC action isn't containment.
+        edge_type = "CONTAINS" if label == "Section" else "REFERENCES"
+        for child_id in mnode.children:
+            edges.append(GraphEdge(from_id=page_id, to_id=child_id, type=edge_type))
+
+        for collapsed in mnode.collapsed_via:
+            edges.append(GraphEdge(
+                from_id=page_id,
+                to_id=page_id,
+                type="REDIRECTED_FROM",
+                properties={"via_id": collapsed.id, "via_label": collapsed.label},
+            ))
+
+    for alias_id, canonical_id in manifest.aliases.items():
+        edges.append(GraphEdge(from_id=alias_id, to_id=canonical_id, type="SAME_AS"))
+
+    # DTC code promotion — walk surviving page content, not the manifest,
+    # since DTCTableContent lives on PageContent, not ManifestNode.
+    for page_id, pc in content_by_id.items():
+        if pc.content.kind != "dtc_table":
+            continue
+        for entry in pc.content.entries:
+            dtc_node_id = f"dtc:{entry.code}"
+            nodes.append(GraphNode(
+                id=dtc_node_id,
+                labels=["DTCCode"],
+                properties={"code": entry.code, "description": entry.description},
+            ))
+            edges.append(GraphEdge(from_id=page_id, to_id=dtc_node_id, type="CONTAINS"))
+            if entry.target_id is not None:
+                edges.append(GraphEdge(
+                    from_id=dtc_node_id,
+                    to_id=entry.target_id,
+                    type="DIAGNOSED_BY",
+                    properties={"action_text": entry.action_text},
+                ))
+
+    return DatasetGraph(dataset_name=dataset.name, nodes=nodes, edges=edges)
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -363,12 +449,18 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
         ],
     )
 
+
     dataset_dir = output_dir / dataset.name
     pages_dir = dataset_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     (dataset_dir / "main.json").write_text(
         manifest.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+    graph_model = build_graph(dataset, manifest, final_content)
+    (dataset_dir / "graph.json").write_text(
+        graph_model.model_dump_json(indent=2, by_alias=True), encoding="utf-8"
     )
 
     for page_id, pc in final_content.items():

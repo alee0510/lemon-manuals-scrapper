@@ -1,44 +1,15 @@
-"""
-Writer: turns a dataset's SiteGraph into the on-disk output layout —
-
-    <output_dir>/<dataset_name>/main.json
-    <output_dir>/<dataset_name>/pages/<id>.json
-
-Three responsibilities live here that don't belong in crawler.py or
-extractor.py:
-
-1. Re-parsing each node's HTML to run extract() — crawler.py discards the
-   BeautifulSoup object once a node is built (it's the cheap structural
-   pass), so getting content requires a second read. For 50k-page
-   datasets this is a real cost; see the note at the bottom of this file.
-
-2. Pass-through collapsing — an INDEX page whose entire content is a
-   single link and no notes (e.g. pages/25280.html "Common Specs &
-   Procedures" -> pages/31917.html "Common Specifications & Procedures")
-   contributes zero real content, just an extra graph hop and a
-   near-duplicate label. These are dropped from output entirely; every
-   edge that pointed at them is rewired straight to their resolved final
-   target, and the target node records provenance via `collapsed_via` so
-   nothing is silently lost. Runs BEFORE alias hashing, since collapsing
-   changes which nodes even exist to be hashed.
-
-3. Alias resolution — for any genuine content duplicates remaining after
-   collapsing (two differently-named pages resolving to byte-identical
-   extracted content), one canonical id is kept and the other becomes an
-   alias entry in main.json rather than its own pages/*.json file.
-"""
-
 from __future__ import annotations
 import hashlib
 from pathlib import Path
 from bs4 import BeautifulSoup
 
 from src.utils.discover import DiscoveredDataset
-from src.models.sites import SiteGraph
+from src.models.sites import SiteGraph, SiteNode
 from src.models.content import PageContent
 from src.models.graph import GraphNode, GraphEdge, DatasetGraph
 from src.models.writer import CollapsedLink, ManifestNode, ManifestBrokenLink, ManifestOutOfScopeLink, DatasetManifest , DatasetGraphSection
 from src.utils.extractor import extract
+from src.utils.crawler import crawler
 
 _LABEL_BY_PAGE_TYPE = {
     "index": "Section",
@@ -412,21 +383,49 @@ def build_graph_section(
 
     return DatasetGraphSection(nodes=nodes, edges=edges)
 
+def _crawl_and_extract(dataset: DiscoveredDataset, entry_point: str = "pages/2.html") -> tuple[SiteGraph, dict[str, PageContent]]:
+    """
+    Single-parse pipeline: runs crawler() with an on_node_parsed callback
+    that extracts content inline, using the same soup the crawl already
+    built, instead of writer.py re-reading and re-parsing every file
+    afterward. Replaces the old two-pass (crawl, then separately
+    _build_content_map) approach.
+    """
+    content_map: dict[str, PageContent] = {}
+
+    def _on_node_parsed(page_path: str, node: SiteNode, soup: BeautifulSoup) -> None:
+        page_id = page_path_to_id(page_path)
+        content_map[page_id] = extract(
+            page_id=page_id,
+            dataset_name=dataset.name,
+            source_path=page_path,
+            page_type=node.page_type,
+            title=node.title,
+            breadcrumbs=node.breadcrumbs,
+            soup=soup,
+        )
+
+    graph = crawler(dataset, entry_point=entry_point, on_node_parsed=_on_node_parsed)
+    return graph, content_map
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph) -> Path:
-    content_map = _build_content_map(dataset, graph)
+def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph, content_map: dict[str, PageContent]) -> Path:
+    """
+    Runs pass-through collapsing + alias resolution for one dataset and
+    writes main.json + pages/<id>.json. content_map is now supplied by
+    the caller (via _crawl_and_extract) instead of built here, so this
+    function no longer re-parses HTML at all.
+    """
     root_id = page_path_to_id(graph.root)
 
     passthroughs = _find_passthroughs(content_map, root_id)
     redirects = _resolve_transitive(passthroughs)
     collapsed_labels = {pid: content_map[pid].title for pid in redirects}
 
-    content_after_collapse = {
-        pid: pc for pid, pc in content_map.items() if pid not in redirects
-    }
+    content_after_collapse = {pid: pc for pid, pc in content_map.items() if pid not in redirects}
     aliases = _resolve_aliases(content_after_collapse)
 
     canonical = _build_canonical_resolver(redirects, aliases)
@@ -434,7 +433,6 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
 
     manifest_nodes = _remap_graph(graph, canonical, collapsed_labels)
     final_content = _remap_content(content_map, canonical, dropped_ids)
-
     root_canonical = canonical(root_id)
 
     manifest = DatasetManifest(
@@ -446,39 +444,30 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
         aliases=aliases,
         nodes=manifest_nodes,
         broken_links=[
-            ManifestBrokenLink(
-                source_page=canonical(page_path_to_id(bl.source_page)),
-                href=bl.href,
-                resolved_path=bl.resolved_path,
-            )
+            ManifestBrokenLink(source_page=canonical(page_path_to_id(bl.source_page)), href=bl.href, resolved_path=bl.resolved_path)
             for bl in graph.broken_links
         ],
         out_of_scope_links=[
-            ManifestOutOfScopeLink(
-                source_page=canonical(page_path_to_id(ol.source_page)),
-                href=ol.href,
-                resolved_path=ol.resolved_path,
-            )
+            ManifestOutOfScopeLink(source_page=canonical(page_path_to_id(ol.source_page)), href=ol.href, resolved_path=ol.resolved_path)
             for ol in graph.out_of_scope_links
         ],
     )
-
-    # graph section is built from the manifest + final content that's
-    # already collapsed/aliased — same as before, just attached to
-    # `manifest.graph` instead of written to a separate file.
     manifest.graph = build_graph_section(dataset, manifest, final_content)
 
     dataset_dir = output_dir / dataset.name
     pages_dir = dataset_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
-    (dataset_dir / "main.json").write_text(
-        manifest.model_dump_json(indent=2, by_alias=True), encoding="utf-8"
-    )
-
+    (dataset_dir / "main.json").write_text(manifest.model_dump_json(indent=2, by_alias=True), encoding="utf-8")
     for page_id, pc in final_content.items():
-        (pages_dir / f"{page_id}.json").write_text(
-            pc.model_dump_json(indent=2), encoding="utf-8"
-        )
+        (pages_dir / f"{page_id}.json").write_text(pc.model_dump_json(indent=2), encoding="utf-8")
 
     return dataset_dir
+
+def is_dataset_already_written(output_dir: Path, dataset: DiscoveredDataset) -> bool:
+    """Resumability check: a dataset is considered done if its main.json
+    already exists. Doesn't validate contents — a partially-written
+    main.json (e.g. process killed mid-write) would be wrongly treated as
+    complete; the write above isn't atomic yet, worth flagging if that's
+    a real risk in your environment."""
+    return (output_dir / dataset.name / "main.json").is_file()

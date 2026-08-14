@@ -17,4 +17,15 @@ class Settings(BaseSettings):
     data_dir: Path = PROJECT_ROOT.parent / "data"
     output_dir: Path = PROJECT_ROOT.parent / "output"
 
+    # Worker count for parallel dataset processing (main.py). Defaults to
+    # 4 — a conservative starting point (~1GB budget per worker per the
+    # 9,610-file / ~150MB-output-per-dataset estimate). Override via
+    # MANUAL_PARSER_MAX_WORKERS in .env once you've measured actual peak
+    # RSS on one real run against your machine's available RAM.
+    max_workers: int = 4
+
+    # Skip datasets whose output already exists (main.json present) on
+    # re-run, instead of reprocessing from scratch — see resumability.
+    skip_existing: bool = True
+
 settings = Settings()

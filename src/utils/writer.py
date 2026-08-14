@@ -14,24 +14,22 @@ extractor.py:
    bottom of this file for how to avoid it later without changing
    crawler.py's contract.
 
-2. Alias resolution — index.html and pages/1.html are confirmed identical
-   content in this dataset (index.html's own breadcrumb links to
-   pages/1.html, so crawler.py's BFS visits both as separate nodes). We
-   don't want two JSON files with duplicate content; pages/1.html becomes
-   an alias entry in main.json instead of its own pages/*.json file, and
-   every reference to "1" elsewhere is rewritten to "index".
+2. Alias resolution — for any genuine content duplicates found within the
+   crawled subtree (e.g. two differently-named pages resolving to
+   byte-identical extracted content), one canonical id is kept and the
+   other becomes an alias entry in main.json rather than its own
+   pages/*.json file.
 """
 
 from __future__ import annotations
 import hashlib
-import json
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
 from src.utils.discover import DiscoveredDataset
-from src.models.sites import SiteGraph, SiteNode
+from src.models.sites import SiteGraph, DatasetMetadata
 from src.models.content import PageContent
 from src.utils.extractor import extract
 
@@ -53,12 +51,21 @@ class ManifestBrokenLink(BaseModel):
     href: str
     resolved_path: str
 
+class ManifestOutOfScopeLink(BaseModel):
+    source_page: str
+    href: str
+    resolved_path: str
+
 class DatasetManifest(BaseModel):
     dataset_name: str
-    root: str = "index"
+    root: str
+    manufacturer: str | None = None
+    year: str | None = None
+    model: str | None = None
     aliases: dict[str, str] = Field(default_factory=dict)   # alias_id -> canonical_id
     nodes: dict[str, ManifestNode] = Field(default_factory=dict)
     broken_links: list[ManifestBrokenLink] = Field(default_factory=list)
+    out_of_scope_links: list[ManifestOutOfScopeLink] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -104,21 +111,17 @@ def _build_content_map(dataset: DiscoveredDataset, graph: SiteGraph) -> dict[str
 
 # ---------------------------------------------------------------------------
 # Pass 2 — hash content bodies, collapse duplicates into aliases.
-# Iterates in dict insertion order, which is BFS discovery order (crawler.py
-# visits index.html before pages/1.html), so the first-seen id always wins
-# as canonical — "index" beats "1", not the other way round.
+# Iterates in dict insertion order, which is BFS discovery order, so the
+# first-seen id always wins as canonical.
 # ---------------------------------------------------------------------------
 
 def _hash_content(pc: PageContent) -> str:
-    # Hash the content body only, not id/source_path/breadcrumbs — those
-    # legitimately differ between index.html and pages/1.html even when
-    # the substantive content is identical.
     payload = pc.content.model_dump_json()
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 def _resolve_aliases(content_map: dict[str, PageContent]) -> dict[str, str]:
     seen_hash_to_id: dict[str, str] = {}
-    aliases: dict[str, str] = {}   # alias_id -> canonical_id
+    aliases: dict[str, str] = {}
 
     for page_id, pc in content_map.items():
         h = _hash_content(pc)
@@ -131,9 +134,7 @@ def _resolve_aliases(content_map: dict[str, PageContent]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Pass 3 — rewrite every id reference (children/parents in the graph,
-# target_id inside extracted content) through the alias map, so nothing
-# downstream ever points at a dropped duplicate like "1".
+# Pass 3 — rewrite every id reference through the alias map.
 # ---------------------------------------------------------------------------
 
 def _canonical(page_id: str, aliases: dict[str, str]) -> str:
@@ -150,8 +151,6 @@ def _remap_graph(graph: SiteGraph, aliases: dict[str, str]) -> dict[str, Manifes
         parents = sorted({_canonical(page_path_to_id(p), aliases) for p in node.parents})
 
         if canonical_id in remapped:
-            # e.g. "1" (alias) and "index" (canonical) both had their own
-            # SiteNode; merge children/parents rather than overwrite.
             existing = remapped[canonical_id]
             existing.children = sorted(set(existing.children) | set(children))
             existing.parents = sorted(set(existing.parents) | set(parents))
@@ -166,13 +165,11 @@ def _remap_graph(graph: SiteGraph, aliases: dict[str, str]) -> dict[str, Manifes
     return remapped
 
 def _remap_content(content_map: dict[str, PageContent], aliases: dict[str, str]) -> dict[str, PageContent]:
-    """Drop alias entries (they don't get their own pages/<id>.json) and
-    rewrite any target_id inside surviving content that pointed at one."""
     remapped: dict[str, PageContent] = {}
 
     for page_id, pc in content_map.items():
         if page_id in aliases:
-            continue  # this page's content is written under its canonical id instead
+            continue
 
         content = pc.content
         if content.kind == "index":
@@ -207,9 +204,17 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
     manifest_nodes = _remap_graph(graph, aliases)
     final_content = _remap_content(content_map, aliases)
 
+    # root is now derived from graph.root (e.g. "pages/2.html" ->
+    # "2"), not hardcoded to "index" — crawler.py's entry point changed,
+    # this must follow it rather than assume a fixed root id.
+    root_id = _canonical(page_path_to_id(graph.root), aliases)
+
     manifest = DatasetManifest(
         dataset_name=dataset.name,
-        root=_canonical("index", aliases),
+        root=root_id,
+        manufacturer=graph.metadata.manufacturer,
+        year=graph.metadata.year,
+        model=graph.metadata.model,
         aliases=aliases,
         nodes=manifest_nodes,
         broken_links=[
@@ -219,6 +224,14 @@ def write_dataset(output_dir: Path, dataset: DiscoveredDataset, graph: SiteGraph
                 resolved_path=bl.resolved_path,
             )
             for bl in graph.broken_links
+        ],
+        out_of_scope_links=[
+            ManifestOutOfScopeLink(
+                source_page=_canonical(page_path_to_id(ol.source_page), aliases),
+                href=ol.href,
+                resolved_path=ol.resolved_path,
+            )
+            for ol in graph.out_of_scope_links
         ],
     )
 

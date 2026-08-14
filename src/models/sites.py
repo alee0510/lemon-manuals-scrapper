@@ -16,11 +16,24 @@ class BrokenLink(BaseModel):
     resolved_path: str
     reason: str = "file_not_found"
 
+class OutOfScopeLink(BaseModel):
+    """A link that resolves to a real, existing page — but one outside
+    the Repair & Diagnosis subtree we crawl from pages/2.html (e.g. a
+    mid-procedure link to Labor Times). Tracked separately from
+    BrokenLink because the target isn't missing/broken, it's just
+    deliberately not traversed for this project's scope."""
+    source_page: str
+    href: str
+    resolved_path: str
+
+class DatasetMetadata(BaseModel):
+    """Brand/year/model, parsed once off the breadcrumb — same on every
+    page in the dataset, so this is a flat lookup, not a graph concern."""
+    manufacturer: str | None = None
+    year: str | None = None
+    model: str | None = None
+
 class SiteNode(BaseModel):
-    """One page in the dataset's link graph. children/parents are stored
-    as page_path string references, NOT nested SiteNode objects — this is
-    what keeps the structure a flat, cycle-safe graph rather than a tree
-    that would infinitely re-expand on the first diamond/cycle."""
     page_path: str
     page_type: PageType
     title: str
@@ -30,6 +43,8 @@ class SiteNode(BaseModel):
 
 class SiteGraph(BaseModel):
     dataset_name: str
-    root: str = "index.html"
+    root: str = "pages/2.html"
+    metadata: DatasetMetadata = Field(default_factory=DatasetMetadata)
     nodes: dict[str, SiteNode] = Field(default_factory=dict)
     broken_links: list[BrokenLink] = Field(default_factory=list)
+    out_of_scope_links: list[OutOfScopeLink] = Field(default_factory=list)

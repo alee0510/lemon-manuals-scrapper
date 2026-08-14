@@ -1,5 +1,9 @@
 """
-BFS crawl of one dataset, starting at index.html.
+BFS crawl of one dataset, starting at pages/2.html (Repair and Diagnosis —
+the section this project scopes to; see project context). index.html /
+pages/1.html (model root, duplicate content) and pages/3.html (same tree
+flattened to one page) and pages/4.html (Labor Times, a sibling section)
+are all out of scope by design, not by accident — see OUT_OF_SCOPE_TARGETS.
 
 Design decisions worth calling out (see conversation history for the
 reasoning behind each):
@@ -18,37 +22,58 @@ reasoning behind each):
    have dead links; we record them in `broken_links` and keep going,
    rather than letting one bad href kill the whole dataset run.
 
-4. `IGNORED_TARGETS` special-cases the site's own placeholder link
-   (404.html) so it doesn't pollute broken_links with noise you already
-   know about and don't care to chase.
+4. NOISE_TARGETS special-cases the site's own placeholder links (404.html,
+   about.html) — these never resolve to real content, so they're dropped
+   silently, same as before.
+
+5. OUT_OF_SCOPE_TARGETS are real, existing pages that are deliberately
+   NOT part of this project's scope (the model-root duplicate and the
+   sibling Labor Times section). Unlike NOISE_TARGETS, these are worth
+   knowing about — recorded in `out_of_scope_links`, not traversed.
 """
 
 from __future__ import annotations
 from collections import deque
+from pathlib import Path
 from bs4 import BeautifulSoup
 
 from src.utils.discover import DiscoveredDataset
-from src.models.sites import Breadcrumb, BrokenLink, SiteGraph, SiteNode
+from src.models.sites import (
+    Breadcrumb,
+    BrokenLink,
+    OutOfScopeLink,
+    DatasetMetadata,
+    SiteGraph,
+    SiteNode,
+)
 from src.utils.path import resolve_href
 from src.utils.signature import classify
 
-IGNORED_TARGETS = {"404.html", "about.html"}
+ENTRY_POINT = "pages/2.html"
 
-def crawler(dataset: DiscoveredDataset) -> SiteGraph:
+# Placeholder links that never resolve to real content — dropped silently,
+# not tracked anywhere.
+NOISE_TARGETS = {"404.html", "about.html"}
+
+# Real pages that exist on disk but are outside this project's scope
+# (model-root duplicate + sibling Labor Times section). Not traversed;
+# recorded in out_of_scope_links so the signal isn't silently lost.
+OUT_OF_SCOPE_TARGETS = {"index.html", "pages/1.html", "pages/3.html", "pages/4.html"}
+
+def crawler(dataset: DiscoveredDataset, entry_point: str = ENTRY_POINT) -> SiteGraph:
     nodes: dict[str, SiteNode] = {}
     broken_links: list[BrokenLink] = []
+    out_of_scope_links: list[OutOfScopeLink] = []
+    seen_out_of_scope: set[tuple[str, str]] = set()  # (source_page, resolved_path) dedupe
 
-    # Each queue entry is (page_path_to_visit, discovered_from_page_path).
-    queue: deque[tuple[str, str | None]] = deque([("index.html", None)])
+    metadata = _extract_metadata(dataset)
+
+    queue: deque[tuple[str, str | None]] = deque([(entry_point, None)])
 
     while queue:
         page_path, discovered_from = queue.popleft()
-        # print(f"Page path: {page_path} - Discovered from: {discovered_from}")
 
         if page_path in nodes:
-            # Already visited via a different parent — this is exactly
-            # the pages/19554.html scenario. Record the extra edge and
-            # move on; do NOT re-read/re-parse/re-classify the file.
             if discovered_from and discovered_from not in nodes[page_path].parents:
                 nodes[page_path].parents.append(discovered_from)
             continue
@@ -56,7 +81,7 @@ def crawler(dataset: DiscoveredDataset) -> SiteGraph:
         file_path = dataset.root_dir / page_path
         if not file_path.is_file():
             broken_links.append(BrokenLink(
-                source_page=discovered_from or "index.html",
+                source_page=discovered_from or entry_point,
                 href=page_path,
                 resolved_path=page_path,
             ))
@@ -73,7 +98,6 @@ def crawler(dataset: DiscoveredDataset) -> SiteGraph:
             breadcrumbs=breadcrumbs,
             parents=[discovered_from] if discovered_from else [],
         )
-        # print(f"Page node: {node}")
         nodes[page_path] = node
 
         for a in soup.find_all("a", href=True):
@@ -83,26 +107,57 @@ def crawler(dataset: DiscoveredDataset) -> SiteGraph:
             ref = resolve_href(page_path, href)
             if ref is None:
                 continue
-            if ref.page_path in IGNORED_TARGETS:
+            if ref.page_path in NOISE_TARGETS:
+                continue
+            if ref.page_path in OUT_OF_SCOPE_TARGETS:
+                key = (page_path, ref.page_path)
+                if key not in seen_out_of_scope:
+                    seen_out_of_scope.add(key)
+                    out_of_scope_links.append(OutOfScopeLink(
+                        source_page=page_path,
+                        href=href,
+                        resolved_path=ref.page_path,
+                    ))
                 continue
             if ref.page_path == page_path:
-                # Self-link — e.g. the current page's own breadcrumb crumb
-                # pointing at itself. Not a real traversal edge.
                 continue
             if ref.page_path not in node.children:
-                # A page can legitimately contain several <a> tags that
-                # all resolve to the same target once fragments are
-                # stripped (e.g. breadcrumb crumbs "Repair and Diagnosis"
-                # and "Quick Lookups" both point at pages/2.html, just
-                # with different #fragments). One edge per distinct
-                # target is what the graph should record.
                 node.children.append(ref.page_path)
             queue.append((ref.page_path, page_path))
 
     return SiteGraph(
         dataset_name=dataset.name,
+        root=entry_point,
+        metadata=metadata,
         nodes=nodes,
         broken_links=broken_links,
+        out_of_scope_links=out_of_scope_links,
+    )
+
+def _extract_metadata(dataset: DiscoveredDataset) -> DatasetMetadata:
+    """
+    One cheap read of index.html's breadcrumb to pull manufacturer/year/
+    model. Crumb shape is consistently:
+        Home(→404) >> Brand(→404) >> Year(→404) >> Model(→pages/1.html) >> ...
+    so positions 1/2/3 (0-indexed) are manufacturer/year/model, regardless
+    of how many crumbs follow on deeper pages.
+    """
+    index_path = dataset.root_dir / "index.html"
+    if not index_path.is_file():
+        return DatasetMetadata()
+
+    soup = BeautifulSoup(index_path.read_text(encoding="utf-8", errors="replace"), "lxml")
+    header = soup.find("div", class_="header")
+    if header is None:
+        return DatasetMetadata()
+
+    crumbs = header.find_all("a", class_="breadcrumb-part")
+    labels = [c.get_text(strip=True) for c in crumbs]
+
+    return DatasetMetadata(
+        manufacturer=labels[1] if len(labels) > 1 else None,
+        year=labels[2] if len(labels) > 2 else None,
+        model=labels[3] if len(labels) > 3 else None,
     )
 
 def _extract_common(soup: BeautifulSoup) -> tuple[str, list[Breadcrumb]]:

@@ -27,6 +27,7 @@ from src.models.content import (
     UnknownContent,
     DTCEntry,
     DTCTableContent,
+    SectionNode
 )
 from src.utils.path import resolve_href
 from src.helper.attribute import _attr_str
@@ -97,33 +98,27 @@ def _extract_body(main: Tag | None, page_type: PageType, source_path: str) -> Pa
 # ---------------------------------------------------------------------------
 
 def _extract_index(main: Tag, source_path: str) -> IndexContent:
-    sections: list[IndexSection] = []
+    sections: list[SectionNode] = []
     notes: list[str] = []
-
-    # Tags that are page chrome, not content — excluded from notes so
-    # e.g. the "Expand All"/"Collapse All" buttons on pages/25280.html
-    # don't block that page from being recognized as a pure pass-through
-    # (single-link INDEX page with no real accompanying text).
     _CHROME_TAGS = {"button", "script", "style"}
 
     for child in main.children:
         if not isinstance(child, Tag):
             continue
-
         if child.name == "ul":
-            sections.append(_extract_index_section(child, source_path))
+            # Each top-level <ul> contributes its <li> children as
+            # root-level SectionNodes; nesting below that is handled
+            # recursively inside _extract_section_nodes.
+            sections.extend(_extract_section_nodes(child, source_path))
         elif child.name == "h1":
-            continue  # title already captured separately via _extract_common in crawler
+            continue
         elif child.name in _CHROME_TAGS:
-            continue  # page chrome, not content
+            continue
         else:
             text = child.get_text(" ", strip=True)
             if text:
                 notes.append(text)
 
-    # main.html often has free text as bare NavigableStrings between tags
-    # (e.g. "This is a LEMON manual, retrieved in 2025.") rather than inside
-    # a wrapping element — pick those up too.
     for child in main.children:
         if isinstance(child, Tag):
             continue
@@ -133,37 +128,50 @@ def _extract_index(main: Tag, source_path: str) -> IndexContent:
 
     return IndexContent(sections=sections, notes=notes)
 
+def _extract_section_nodes(ul: Tag, source_path: str) -> list[SectionNode]:
+    """
+    Walks direct <li> children of `ul`. Both <img class="folder-icon">,
+    <a>, and a possible nested <ul> are direct children of the <li> in
+    this markup (confirmed against the real pages/2.html), so
+    recursive=False is safe and avoids accidentally matching a
+    grandchild's <a>/<ul>.
 
-def _extract_index_section(ul: Tag, source_path: str) -> IndexSection:
-    items: list[IndexItem] = []
+    A <li> with a direct child <ul> is a TOC grouping — its <a> is a
+    named anchor (<a name="...">, no href), label only, recurse into the
+    nested <ul> for children. A <li> without one is a PAGE leaf — its
+    <a> has a real href, resolved to a target page id the same way
+    graph edges are resolved.
+    """
+    nodes: list[SectionNode] = []
+
     for li in ul.find_all("li", recursive=False):
-        a = li.find("a")
+        a = li.find("a", recursive=False)
         if a is None:
             continue
 
-        href = _attr_str(a.get("href"))
-        target_id = _resolve_target_id(source_path, href)
-
-        icon_img = li.find("img", class_="folder-icon")
+        icon_img = li.find("img", class_="folder-icon", recursive=False)
         icon = None
         if icon_img is not None:
             src = _attr_str(icon_img.get("src"))
             icon = src.rsplit("/", 1)[-1] if src else None
 
-        items.append(IndexItem(
-            label=a.get_text(strip=True),
-            target_id=target_id,
-            href=href,
-            icon=icon,
-        ))
+        label = a.get_text(strip=True)
+        nested_ul = li.find("ul", recursive=False)
 
-    # Section name isn't in the <ul> itself on these sample pages (it lives
-    # in a preceding heading/anchor, e.g. the "#Quick Lookups/..." breadcrumb
-    # fragments on pages/25280.html) — left as None here. The writer step can
-    # backfill `name` from breadcrumb fragments once target pages are known,
-    # rather than guessing at extraction time.
-    return IndexSection(name=None, items=items)
+        if nested_ul is not None:
+            nodes.append(SectionNode(
+                label=label, type="TOC", page_id=None, href=None, icon=icon,
+                children=_extract_section_nodes(nested_ul, source_path),
+            ))
+        else:
+            href = _attr_str(a.get("href"))
+            target_id = _resolve_target_id(source_path, href)
+            nodes.append(SectionNode(
+                label=label, type="PAGE", page_id=target_id, href=href or None, icon=icon,
+                children=[],
+            ))
 
+    return nodes
 
 # ---------------------------------------------------------------------------
 # TABLE — covers both FLAT_TABLE (pages/31879.html) and

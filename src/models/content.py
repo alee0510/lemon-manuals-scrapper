@@ -23,13 +23,13 @@ class IndexSection(BaseModel):
     name: str | None = None        # heading text / anchor name, None if page has no sub-sections
     items: list[IndexItem] = Field(default_factory=list)
 
-class IndexContent(BaseModel):
-    kind: Literal["index"] = "index"
-    sections: list[IndexSection] = Field(default_factory=list)
-    # Free text that sits in main but outside any <ul> (e.g. the
-    # "This is a LEMON manual, retrieved in 2025." line, or the
-    # "identical to the following model variants" note on index.html).
-    notes: list[str] = Field(default_factory=list)
+# class IndexContent(BaseModel):
+#     kind: Literal["index"] = "index"
+#     sections: list[IndexSection] = Field(default_factory=list)
+#     # Free text that sits in main but outside any <ul> (e.g. the
+#     # "This is a LEMON manual, retrieved in 2025." line, or the
+#     # "identical to the following model variants" note on index.html).
+#     notes: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +92,6 @@ class DTCTableContent(BaseModel):
     entries: list[DTCEntry] = Field(default_factory=list)
 
 
-PageContentBody = Union[IndexContent, TableContent, DTCTableContent, ImageDescriptionContent, UnknownContent]
-
 
 # ---------------------------------------------------------------------------
 # Envelope — the shape every pages/<id>.json file has in common, regardless
@@ -101,6 +99,34 @@ PageContentBody = Union[IndexContent, TableContent, DTCTableContent, ImageDescri
 # stay easy to cross-reference, but deliberately carries no children/parents
 # (that stays in main.json / the graph manifest, not per-page docs).
 # ---------------------------------------------------------------------------
+
+class SectionNode(BaseModel):
+    """
+    One node in a page's navigation tree. TOC nodes are pure editorial
+    groupings with no page of their own (source: <a name="..."> + a
+    nested <ul>, e.g. "Quick Lookups", "DTC Index") — page_id is always
+    None, children holds the nested nodes. PAGE nodes are real links
+    (source: <a href="...">) — a leaf, children is always empty.
+
+    Recursive by design: page2.html nests 4+ levels deep (Quick Lookups >
+    DTC Index > 4 leaf links), while a page like the old pages/25280.html
+    is just a depth-1 tree with one PAGE node — same model serves both.
+    """
+    label: str
+    type: Literal["TOC", "PAGE"]
+    page_id: str | None = None   # canonical page id, PAGE nodes only
+    href: str | None = None      # original href, kept for traceability, PAGE nodes only
+    icon: str | None = None
+    children: list["SectionNode"] = Field(default_factory=list)
+
+SectionNode.model_rebuild()
+
+class IndexContent(BaseModel):
+    kind: Literal["index"] = "index"
+    sections: list[SectionNode] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+PageContentBody = Union[IndexContent, TableContent, DTCTableContent, ImageDescriptionContent, UnknownContent]
 
 class PageContent(BaseModel):
     id: str                        # stable id from filename, e.g. "31917"; "index" for the root

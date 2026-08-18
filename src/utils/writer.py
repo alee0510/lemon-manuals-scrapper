@@ -60,7 +60,7 @@ def _crawl_and_extract(dataset: DiscoveredDataset, entry_point: str = "pages/2.h
         page_id = page_path_to_id(page_path)
         content_map[page_id] = extract(
             page_id=page_id, dataset_name=dataset.name, source_path=page_path,
-            page_type=node.page_type, title=node.title, breadcrumbs=node.breadcrumbs, soup=soup,
+            page_type=node.page_type, title=node.title, soup=soup,
         )
 
     graph = crawler(dataset, entry_point=entry_point, on_node_parsed=_on_node_parsed)

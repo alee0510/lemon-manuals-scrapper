@@ -46,7 +46,6 @@ def extract(
     source_path: str,
     page_type: PageType,
     title: str,
-    breadcrumbs: list,
     soup: BeautifulSoup,
 ) -> PageContent:
     """
@@ -63,7 +62,6 @@ def extract(
         source_path=source_path,
         page_type=page_type,
         title=title,
-        breadcrumbs=breadcrumbs,
         content=body,
     )
 

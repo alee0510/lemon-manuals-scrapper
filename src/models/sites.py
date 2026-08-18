@@ -3,10 +3,6 @@ from pydantic import BaseModel, Field
 
 from src.models.signature import PageType
 
-class Breadcrumb(BaseModel):
-    label: str
-    href: str | None = None
-
 class BrokenLink(BaseModel):
     """An href that resolved to a canonical page_path, but that path
     doesn't exist on disk. Recorded, not raised — a broken link in a
@@ -34,14 +30,18 @@ class DatasetMetadata(BaseModel):
     model: str | None = None
 
 class SiteNode(BaseModel):
+    """A node in the page graph, representing a single HTML page.
+    """
     page_path: str
     page_type: PageType
     title: str
-    breadcrumbs: list[Breadcrumb] = Field(default_factory=list)
     children: list[str] = Field(default_factory=list)
     parents: list[str] = Field(default_factory=list)
 
 class SiteGraph(BaseModel):
+    """The full page-level graph for a single dataset: node
+    -> children (directed edges).
+    """
     dataset_name: str
     root: str = "pages/2.html"
     metadata: DatasetMetadata = Field(default_factory=DatasetMetadata)

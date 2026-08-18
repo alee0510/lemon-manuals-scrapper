@@ -3,8 +3,6 @@ from typing import Union, Literal
 from pydantic import BaseModel, Field
 
 from src.models.signature import PageType
-from src.models.sites import Breadcrumb
-
 
 # ---------------------------------------------------------------------------
 # INDEX pages (index.html, pages/2.html, pages/3.html, pages/4.html, ...)
@@ -134,5 +132,4 @@ class PageContent(BaseModel):
     source_path: str               # e.g. "pages/31917.html", for traceability back to the source HTML
     page_type: PageType
     title: str
-    breadcrumbs: list[Breadcrumb] = Field(default_factory=list)
     content: PageContentBody

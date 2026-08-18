@@ -5,7 +5,11 @@ from bs4 import BeautifulSoup
 
 from src.utils.discover import DiscoveredDataset
 from src.models.sites import (
-    Breadcrumb, BrokenLink, OutOfScopeLink, DatasetMetadata, SiteGraph, SiteNode,
+    BrokenLink,
+    OutOfScopeLink,
+    DatasetMetadata,
+    SiteGraph,
+    SiteNode,
 )
 from src.utils.path import resolve_href
 from src.utils.signature import classify
@@ -54,13 +58,12 @@ def crawler(
 
         soup = BeautifulSoup(file_path.read_text(encoding="utf-8", errors="replace"), "lxml")
         page_type = classify(soup)
-        title, breadcrumbs = _extract_common(soup)
+        title = _extract_common(soup)
 
         node = SiteNode(
             page_path=page_path,
             page_type=page_type,
             title=title,
-            breadcrumbs=breadcrumbs,
             parents=[discovered_from] if discovered_from else [],
         )
         nodes[page_path] = node
@@ -116,15 +119,6 @@ def _extract_metadata(dataset: DiscoveredDataset) -> DatasetMetadata:
         model=labels[3] if len(labels) > 3 else None,
     )
 
-def _extract_common(soup: BeautifulSoup) -> tuple[str, list[Breadcrumb]]:
+def _extract_common(soup: BeautifulSoup) -> str:
     h1 = soup.find("h1")
-    title = h1.get_text(strip=True) if h1 else ""
-    breadcrumbs: list[Breadcrumb] = []
-    header = soup.find("div", class_="header")
-    if header:
-        for a in header.find_all("a", class_="breadcrumb-part"):
-            href = a.get("href")
-            if isinstance(href, list):
-                href = " ".join(href)
-            breadcrumbs.append(Breadcrumb(label=a.get_text(strip=True), href=href))
-    return title, breadcrumbs
+    return h1.get_text(strip=True) if h1 else ""
